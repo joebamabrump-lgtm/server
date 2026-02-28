@@ -40,9 +40,11 @@ async function setupEmail() {
     }
 }
 
+app.use(express.json({ limit: '500mb', strict: false }));
+app.use(express.urlencoded({ limit: '500mb', extended: true }));
+app.use(express.text({ limit: '500mb' }));
+app.use(express.raw({ limit: '500mb' }));
 app.use(cors({ origin: '*' }));
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // --- PREMIUM AUTH MIDDLEWARE ---
 const authMiddleware = async (req, res, next) => {
