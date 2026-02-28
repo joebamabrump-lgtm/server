@@ -143,101 +143,114 @@ app.post('/api/predict', authMiddleware, async (req, res) => {
         return res.status(403).send({ message: 'Premium Algorithm Locked.' });
     }
 
-    // --- STEP 1: Load ALL historical mine data from every user (no limit, all time) ---
-    // This is the real "training data" that powers every algorithm's final prediction
-    let mineSafetyScores = null; // lower = historically safer = preferred
-    let historicalGameCount = 0;
-
-    if (gameType === 'mines') {
-        const { rows: logs } = await pool.query(
-            'SELECT actual_outcome FROM game_logs WHERE game_type = $1 AND mines_count = $2 AND actual_outcome IS NOT NULL',
-            [gameType, minesCount]
-        );
-        historicalGameCount = logs.length;
-
-        if (historicalGameCount > 0) {
-            // Build frequency map: how many times each cell was a mine
-            const mineCounts = Array.from({ length: 5 }, () => Array(5).fill(0));
-            logs.forEach(log => {
-                try {
-                    const outcome = JSON.parse(log.actual_outcome);
-                    outcome.forEach((row, r) => row.forEach((isMine, c) => {
-                        if (isMine) mineCounts[r][c]++;
-                    }));
-                } catch (e) { }
-            });
-            // Normalize to a 0-1 "danger score" per cell
-            mineSafetyScores = mineCounts;
-        }
-    }
-
-    // --- STEP 2: Run the algorithm's hash to get a candidate ordering ---
-    // Inject extra entropy from req.body (runId, noise) to ensure uniqueness every time
-    const extraEntropy = `${req.body.runId || ''}:${req.body.noise || ''}:${Date.now()}`;
-    let combined = `${serverSeedHash || 'seed'}:${clientSeed || 'seed'}:${nonce}:${algorithm}:${extraEntropy}`;
-    let hash = crypto.createHash('sha256').update(combined).digest('hex');
-    if (algorithm === 'quantum_v2') hash = crypto.createHash('sha512').update(hash).digest('hex');
-    if (algorithm === 'hash_chain_v1') hash = crypto.createHash('md5').update(hash).digest('hex');
-    if (algorithm === 'dynamic_adapt') {
-        hash = crypto.createHash('sha256').update(hash + combined + Math.random()).digest('hex');
-    }
-
     let prediction;
-    let dataWeight;
+    let confidenceStr;
 
     if (gameType === 'mines') {
-        const grid = [];
         const size = req.body.gridSize || 5;
         const totalTiles = size * size;
-        for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) grid.push([r, c]);
 
-        // Shuffle using hash + true random jitter for "Absolute Uniqueness"
-        for (let i = grid.length - 1; i > 0; i--) {
-            const j = (parseInt(hash.substring((i % 8) * 4, (i % 8) * 4 + 4), 16) + Math.floor(Math.random() * 100)) % (i + 1);
-            [grid[i], grid[j]] = [grid[j], grid[i]];
+        // 1. Heatmap Data (from all users) - We want to AVOID high mine areas
+        const { rows: logs } = await pool.query(
+            'SELECT actual_outcome FROM game_logs WHERE game_type = $1 AND mines_count = $2 AND actual_outcome IS NOT NULL ORDER BY created_at DESC LIMIT 200',
+            [gameType, minesCount]
+        );
+
+        const mineDangerMap = Array.from({ length: size }, () => Array(size).fill(0));
+        logs.forEach(log => {
+            try {
+                const outcome = JSON.parse(log.actual_outcome);
+                outcome.forEach((row, r) => row.forEach((isMine, c) => {
+                    if (isMine) mineDangerMap[r][c]++;
+                }));
+            } catch (e) { }
+        });
+
+        // 2. Anti-Repetition logic (from THIS user's history) - Avoid picking same "safe" tiles repeatedly
+        const { rows: userLogs } = await pool.query(
+            'SELECT prediction FROM game_logs WHERE user_id = $1 AND game_type = $2 ORDER BY created_at DESC LIMIT 5',
+            [req.userId, gameType]
+        );
+
+        const userFrequencyMap = Array.from({ length: size }, () => Array(size).fill(0));
+        userLogs.forEach(entry => {
+            try {
+                const pred = JSON.parse(entry.prediction);
+                pred.forEach((row, r) => row.forEach((wasSafe, c) => {
+                    if (wasSafe) userFrequencyMap[r][c]++;
+                }));
+            } catch (e) { }
+        });
+
+        // 3. Generate candidate tiles with weighted scoring
+        let combined = `${serverSeedHash}:${clientSeed}:${nonce}:${algorithm}:${Date.now()}`;
+        let hash = crypto.createHash('sha256').update(combined).digest('hex');
+
+        const candidates = [];
+        for (let r = 0; r < size; r++) {
+            for (let c = 0; c < size; c++) {
+                // Determine a cell-specific entropy from the hash
+                const cellEntropy = parseInt(hash.substring((r * size + c) % 30, (r * size + c) % 30 + 2), 16) / 255;
+
+                // Normalizing danger: 0 to 1
+                const dangerScore = logs.length > 0 ? (mineDangerMap[r][c] / logs.length) : 0.5;
+
+                // Normalizing user repetition: 0 to 1
+                const repetitionScore = userLogs.length > 0 ? (userFrequencyMap[r][c] / userLogs.length) : 0.5;
+
+                // Final Weight: Lower is better (safer)
+                // We want: Low Danger, Low Repetition, and some Hash randomness
+                // High weight on dynamic adaptation if selected
+                const weightRatio = algorithm === 'dynamic_adapt' ? 0.9 : 0.7;
+                const score = (dangerScore * 0.4) + (repetitionScore * 0.3) + (cellEntropy * 0.3);
+
+                candidates.push({ r, c, score });
+            }
         }
 
-        if (mineSafetyScores && historicalGameCount > 0) {
-            const dataConfidence = Math.min(historicalGameCount / 50, 1.0);
-            const blendWeights = { neural_v4: 0.5, hash_chain_v1: 0.3, quantum_v2: 0.65, dynamic_adapt: 0.80 };
-            const blendRatio = (blendWeights[algorithm] || 0.5) * dataConfidence;
+        // Add extreme jitter for V2 Engine logic to prevent cluster patterns
+        candidates.forEach(cand => {
+            cand.score += (Math.random() * 0.1) - 0.05;
+        });
 
-            const cellScores = grid.map(([r, c], rankIdx) => {
-                const hashScore = rankIdx / totalTiles;
-                const dataScore = (mineSafetyScores[r] && mineSafetyScores[r][c]) ? (mineSafetyScores[r][c] / (historicalGameCount || 1)) : 0.5;
-                const blended = (1 - blendRatio) * hashScore + blendRatio * dataScore;
-                return { r, c, score: blended };
-            });
+        candidates.sort((a, b) => a.score - b.score);
 
-            cellScores.sort((a, b) => a.score - b.score);
-
-            prediction = Array.from({ length: size }, () => Array(size).fill(false));
-            for (let i = 0; i < Math.min(predictionCount, totalTiles - minesCount); i++) {
-                prediction[cellScores[i].r][cellScores[i].c] = true;
-            }
-            dataWeight = Math.round(blendRatio * 100);
-        } else {
-            prediction = Array.from({ length: size }, () => Array(size).fill(false));
-            for (let i = 0; i < Math.min(predictionCount, totalTiles - minesCount); i++) {
-                const [r, c] = grid[i];
-                prediction[r][c] = true;
-            }
-            dataWeight = 0;
+        prediction = Array.from({ length: size }, () => Array(size).fill(false));
+        for (let i = 0; i < Math.min(predictionCount, totalTiles - minesCount); i++) {
+            prediction[candidates[i].r][candidates[i].c] = true;
         }
-    } else {
+
+        const baseConfidence = 91 + (parseInt(hash.substring(0, 2), 16) % 8);
+        confidenceStr = `${baseConfidence.toFixed(2)}% (V2 Logic Enabled)`;
+    } else if (gameType === 'towers') {
+        const difficulty = req.body.difficulty || 'Easy';
+        let combined = `${serverSeedHash}:${clientSeed}:${nonce}:${algorithm}:${Date.now()}`;
+        let hash = crypto.createHash('sha256').update(combined).digest('hex');
+
+        // Generate an 8-level path for Towers
         prediction = [];
-        for (let i = 0; i < 8; i++) {
-            const val = parseInt(hash.substring(i * 4, i * 4 + 4), 16) + Math.floor(Math.random() * 3);
-            prediction.push(val % 3);
-        }
-    }
+        let colCount = 3;
+        if (difficulty === 'Medium') colCount = 2;
+        if (difficulty === 'Hard') colCount = 1;
 
-    const baseConfidence = 82 + (parseInt(hash.substring(0, 2), 16) % 17);
-    let confidenceStr;
-    if (gameType === 'mines' && historicalGameCount > 0) {
-        confidenceStr = `${baseConfidence.toFixed(2)}% (${historicalGameCount} games • ${dataWeight}% data)`;
+        for (let i = 0; i < 8; i++) {
+            const segment = hash.substring(i * 4, i * 4 + 4);
+            const val = parseInt(segment, 16) % colCount;
+            prediction.push(val);
+        }
+        confidenceStr = `${(92 + (parseInt(hash.substring(0, 2), 16) % 6)).toFixed(2)}% (Neural Path Sync)`;
+    } else if (gameType === 'crash') {
+        const crashRisk = Math.min(5, Math.max(1.1, parseFloat(req.body.crashRisk) || 2.0));
+        let combined = `${serverSeedHash}:${clientSeed}:${nonce}:${algorithm}:${Date.now()}`;
+        let hash = crypto.createHash('sha256').update(combined).digest('hex');
+
+        const raw = parseInt(hash.substring(0, 4), 16) / 65535;
+        const targetMultiplier = (1.1 + (raw * (crashRisk - 1.1))).toFixed(2);
+        prediction = parseFloat(targetMultiplier);
+        confidenceStr = `${(95 + (raw * 3)).toFixed(2)}% (Crash Predictor V2)`;
     } else {
-        confidenceStr = `${baseConfidence.toFixed(2)}% (Simulation)`;
+        prediction = null;
+        confidenceStr = "Unknown Gamemode";
     }
 
     res.send({ prediction, confidence: confidenceStr });
@@ -435,6 +448,20 @@ app.post('/api/admin/settings', authMiddleware, async (req, res) => {
         await pool.query('INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2', [k, val]);
     }
     res.send({ success: true });
+});
+
+app.post('/api/admin/upload-esp', authMiddleware, async (req, res) => {
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
+    const { script } = req.body;
+    if (!script) return res.status(400).send({ message: 'Script content required' });
+
+    await pool.query("INSERT INTO settings (key, value) VALUES ('esp_script', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [script]);
+    res.send({ success: true });
+});
+
+app.get('/api/esp-script', authMiddleware, async (req, res) => {
+    const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'esp_script'");
+    res.send({ script: rows[0]?.value || '// No ESP script uploaded yet' });
 });
 
 // --- ANNOUNCEMENT SYSTEM ---

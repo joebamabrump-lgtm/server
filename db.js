@@ -206,6 +206,43 @@ async function initDb() {
       )
     `);
 
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS game_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        game_type TEXT,
+        mines_count INTEGER,
+        prediction TEXT,
+        actual_outcome TEXT,
+        client_seed TEXT,
+        server_seed_hash TEXT,
+        nonce INTEGER,
+        confidence TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      )
+    `);
+
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS payment_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        wallet_address TEXT,
+        amount REAL,
+        coin TEXT,
+        status TEXT DEFAULT 'pending',
+        tx_hash TEXT UNIQUE,
+        email TEXT,
+        user_key TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // Migration for SQLite
     try {
       await pool.query("ALTER TABLE keys ADD COLUMN admin_type TEXT DEFAULT 'none'");
