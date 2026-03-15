@@ -69,6 +69,9 @@ async function initDb() {
           blox_cookie TEXT,
           blox_balance TEXT,
           total_profits REAL DEFAULT 0,
+          user_type TEXT DEFAULT 'free',
+          predictions_today INTEGER DEFAULT 0,
+          predictions_reset_date TEXT,
           FOREIGN KEY(referred_by_id) REFERENCES keys(id)
         );
 
@@ -109,6 +112,7 @@ async function initDb() {
           tx_hash TEXT UNIQUE,
           email TEXT,
           user_key TEXT,
+          duration_hours INTEGER DEFAULT 24,
           created_at TIMESTAMP DEFAULT NOW()
         );
 
@@ -130,6 +134,9 @@ async function initDb() {
       await client.query(`
         DO $$ 
         BEGIN 
+          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='payment_requests' AND column_name='duration_hours') THEN
+            ALTER TABLE payment_requests ADD COLUMN duration_hours INTEGER DEFAULT 24;
+          END IF;
           IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='keys' AND column_name='admin_type') THEN
             ALTER TABLE keys ADD COLUMN admin_type TEXT DEFAULT 'none';
           END IF;
@@ -150,6 +157,15 @@ async function initDb() {
           END IF;
           IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='keys' AND column_name='total_profits') THEN
             ALTER TABLE keys ADD COLUMN total_profits REAL DEFAULT 0;
+          END IF;
+          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='keys' AND column_name='user_type') THEN
+            ALTER TABLE keys ADD COLUMN user_type TEXT DEFAULT 'free';
+          END IF;
+          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='keys' AND column_name='predictions_today') THEN
+            ALTER TABLE keys ADD COLUMN predictions_today INTEGER DEFAULT 0;
+          END IF;
+          IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='keys' AND column_name='predictions_reset_date') THEN
+            ALTER TABLE keys ADD COLUMN predictions_reset_date TEXT;
           END IF;
         END $$;
       `);
@@ -179,7 +195,10 @@ async function initDb() {
         bloxgame_balance REAL DEFAULT 0,
         blox_cookie TEXT,
         blox_balance TEXT,
-        total_profits REAL DEFAULT 0
+        total_profits REAL DEFAULT 0,
+        user_type TEXT DEFAULT 'free',
+        predictions_today INTEGER DEFAULT 0,
+        predictions_reset_date TEXT
       )
     `);
 
@@ -239,22 +258,23 @@ async function initDb() {
         tx_hash TEXT UNIQUE,
         email TEXT,
         user_key TEXT,
+        duration_hours INTEGER DEFAULT 24,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
     // Migration for SQLite
-    try {
-      await pool.query("ALTER TABLE keys ADD COLUMN admin_type TEXT DEFAULT 'none'");
-    } catch (e) { }
-    try {
-      await pool.query("ALTER TABLE keys ADD COLUMN last_read_announcement_id INTEGER DEFAULT 0");
-    } catch (e) { }
+    try { await pool.query("ALTER TABLE payment_requests ADD COLUMN duration_hours INTEGER DEFAULT 24"); } catch (e) { }
+    try { await pool.query("ALTER TABLE keys ADD COLUMN admin_type TEXT DEFAULT 'none'"); } catch (e) { }
+    try { await pool.query("ALTER TABLE keys ADD COLUMN last_read_announcement_id INTEGER DEFAULT 0"); } catch (e) { }
     try { await pool.query("ALTER TABLE keys ADD COLUMN bloxgame_cookie TEXT"); } catch (e) { }
     try { await pool.query("ALTER TABLE keys ADD COLUMN bloxgame_balance REAL DEFAULT 0"); } catch (e) { }
     try { await pool.query("ALTER TABLE keys ADD COLUMN blox_cookie TEXT"); } catch (e) { }
     try { await pool.query("ALTER TABLE keys ADD COLUMN blox_balance TEXT"); } catch (e) { }
     try { await pool.query("ALTER TABLE keys ADD COLUMN total_profits REAL DEFAULT 0"); } catch (e) { }
+    try { await pool.query("ALTER TABLE keys ADD COLUMN user_type TEXT DEFAULT 'free'"); } catch (e) { }
+    try { await pool.query("ALTER TABLE keys ADD COLUMN predictions_today INTEGER DEFAULT 0"); } catch (e) { }
+    try { await pool.query("ALTER TABLE keys ADD COLUMN predictions_reset_date TEXT"); } catch (e) { }
 
     console.log('✅ SQLite database ready');
   }
@@ -265,11 +285,11 @@ async function initDb() {
   if (checkNiam.rows.length === 0) {
     const refCode = 'NIAM-' + Math.random().toString(36).substring(2, 7).toUpperCase();
     await pool.query(
-      "INSERT INTO keys (key_value, username, is_admin, is_registered, referral_code, admin_type) VALUES ($1, 'AdminBoss', 1, 1, $2, 'full')",
+      "INSERT INTO keys (key_value, username, is_admin, is_registered, referral_code, admin_type, user_type) VALUES ($1, 'AdminBoss', 1, 1, $2, 'full', 'premium')",
       [adminKeyNiam, refCode]
     );
   } else {
-    await pool.query("UPDATE keys SET admin_type = 'full' WHERE key_value = $1", [adminKeyNiam]);
+    await pool.query("UPDATE keys SET admin_type = 'full', user_type = 'premium' WHERE key_value = $1", [adminKeyNiam]);
   }
 
   const adminKeyBlazee = 'admin-blazee';
@@ -277,11 +297,11 @@ async function initDb() {
   if (checkBlazee.rows.length === 0) {
     const refCode = 'BLZE-' + Math.random().toString(36).substring(2, 7).toUpperCase();
     await pool.query(
-      "INSERT INTO keys (key_value, username, is_admin, is_registered, referral_code, admin_type) VALUES ($1, 'KeyForge', 1, 1, $2, 'keygen')",
+      "INSERT INTO keys (key_value, username, is_admin, is_registered, referral_code, admin_type, user_type) VALUES ($1, 'KeyForge', 1, 1, $2, 'keygen', 'premium')",
       [adminKeyBlazee, refCode]
     );
   } else {
-    await pool.query("UPDATE keys SET admin_type = 'keygen' WHERE key_value = $1", [adminKeyBlazee]);
+    await pool.query("UPDATE keys SET admin_type = 'keygen', user_type = 'premium' WHERE key_value = $1", [adminKeyBlazee]);
   }
 
   const keysWithoutRef = await pool.query('SELECT id FROM keys WHERE referral_code IS NULL');

